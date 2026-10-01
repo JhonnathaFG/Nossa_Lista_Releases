@@ -2,7 +2,9 @@ name: Indexar APK assinado
 
 on:
   release:
-    types: [published]
+    types: [published, edited]
+  schedule:
+    - cron: '17 */6 * * *'
   push:
     branches: [main]
     paths: [.github/workflows/index-apk.yml]
@@ -34,19 +36,33 @@ jobs:
             exit 1
           fi
           apk_name="Nossa-Lista-${tag#v}.apk"
-          gh release view "$tag" --repo "$GH_REPO" --json assets --jq '.assets[].name' | grep -Fx "$apk_name" >/dev/null
+          release_json="$(gh api "repos/$GH_REPO/releases/tags/$tag")"
+          apk_updated="$(jq -r --arg name "$apk_name" '.assets[] | select(.name == $name) | .updated_at' <<< "$release_json")"
+          manifest_updated="$(jq -r '.assets[] | select(.name == "release.json") | .updated_at' <<< "$release_json")"
+          if [ -z "$apk_updated" ]; then
+            echo "O Release ainda não contém $apk_name" >&2
+            exit 1
+          fi
+          if [[ -n "$manifest_updated" && "$manifest_updated" > "$apk_updated" ]]; then
+            echo "Release $tag já indexado."
+            echo 'INDEX_REQUIRED=false' >> "$GITHUB_ENV"
+            exit 0
+          fi
           mkdir -p "$RUNNER_TEMP/nossa-lista-release"
           gh release download "$tag" --repo "$GH_REPO" --pattern "$apk_name" --dir "$RUNNER_TEMP/nossa-lista-release"
+          echo 'INDEX_REQUIRED=true' >> "$GITHUB_ENV"
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           echo "APK_PATH=$RUNNER_TEMP/nossa-lista-release/$apk_name" >> "$GITHUB_ENV"
 
       - name: Instalar ferramentas Android
+        if: env.INDEX_REQUIRED == 'true'
         run: |
           set -euo pipefail
           managers=("$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager)
           "${managers[0]}" 'build-tools;35.0.0' >/dev/null
 
       - name: Conferir versão e assinatura e criar manifesto
+        if: env.INDEX_REQUIRED == 'true'
         run: |
           python3 - <<'PY'
           import hashlib
@@ -90,6 +106,7 @@ jobs:
           PY
 
       - name: Publicar índice no mesmo Release
+        if: env.INDEX_REQUIRED == 'true'
         run: |
           set -euo pipefail
           gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/release.json" --repo "$GH_REPO" --clobber
