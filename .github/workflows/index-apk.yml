@@ -1,0 +1,96 @@
+name: Indexar APK assinado
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [main]
+    paths: [.github/workflows/index-apk.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  index:
+    if: github.event_name != 'release' || !github.event.release.prerelease
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Baixar o APK do Release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          if [ -z "$tag" ]; then
+            tag="$(gh release view --repo "$GH_REPO" --json tagName --jq .tagName)"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "A tag deve seguir o formato v0.4.4" >&2
+            exit 1
+          fi
+          apk_name="Nossa-Lista-${tag#v}.apk"
+          gh release view "$tag" --repo "$GH_REPO" --json assets --jq '.assets[].name' | grep -Fx "$apk_name" >/dev/null
+          mkdir -p "$RUNNER_TEMP/nossa-lista-release"
+          gh release download "$tag" --repo "$GH_REPO" --pattern "$apk_name" --dir "$RUNNER_TEMP/nossa-lista-release"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "APK_PATH=$RUNNER_TEMP/nossa-lista-release/$apk_name" >> "$GITHUB_ENV"
+
+      - name: Instalar ferramentas Android
+        run: |
+          set -euo pipefail
+          managers=("$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager)
+          "${managers[0]}" 'build-tools;35.0.0' >/dev/null
+
+      - name: Conferir versão e assinatura e criar manifesto
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          apk = Path(os.environ['APK_PATH'])
+          tag = os.environ['RELEASE_TAG']
+          tools = Path(os.environ['ANDROID_HOME']) / 'build-tools' / '35.0.0'
+          badging = subprocess.run([str(tools / 'aapt'), 'dump', 'badging', str(apk)], check=True, capture_output=True, text=True).stdout
+          match = re.search(r"^package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']+)'", badging, re.M)
+          if not match or match.group(1) != 'com.jhonnathafg.nossalista' or match.group(3) != tag[1:]:
+              raise SystemExit('O pacote ou a versão interna do APK não corresponde ao Release.')
+          signature = subprocess.run([str(tools / 'apksigner'), 'verify', '--print-certs', str(apk)], check=True, capture_output=True, text=True).stdout
+          certificate = re.search(r'^Signer #1 certificate SHA-256 digest: ([0-9a-fA-F]{64})$', signature, re.M)
+          trusted = '7294f0664ac03a84cbedfb110ede20af52cd1b8cf392c14415cd814738060bf8'
+          if not certificate or certificate.group(1).lower() != trusted:
+              raise SystemExit('O APK não foi assinado com a chave instalada nos aparelhos.')
+          size = apk.stat().st_size
+          if not 1024 * 1024 <= size <= 250 * 1024 * 1024:
+              raise SystemExit('Tamanho do APK fora do limite permitido.')
+          digest = hashlib.sha256()
+          with apk.open('rb') as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                  digest.update(chunk)
+          manifest = {
+              'packageName': match.group(1),
+              'version': match.group(3),
+              'versionCode': int(match.group(2)),
+              'apkName': apk.name,
+              'sizeBytes': size,
+              'sha256': digest.hexdigest(),
+              'signerSha256': trusted,
+          }
+          target = Path(os.environ['RUNNER_TEMP']) / 'release.json'
+          target.write_text(json.dumps(manifest, separators=(',', ':')) + '\n', encoding='utf-8')
+          print(f"APK {manifest['version']} (build {manifest['versionCode']}) validado: {manifest['sha256']}")
+          PY
+
+      - name: Publicar índice no mesmo Release
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/release.json" --repo "$GH_REPO" --clobber
+          gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json assets --jq '.assets[].name' | grep -Fx release.json >/dev/null
